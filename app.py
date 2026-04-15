@@ -36,37 +36,59 @@ DATA_FILES = {
     "ukfields.parquet":            "1PequKF-t8K_JgLnD0YVwNz2dos9jQklC",
 }
 
-def _gdrive_url(file_id: str) -> str:
-    return f"https://drive.google.com/uc?export=download&id={file_id}"
-
-def _gdrive_url_large(file_id: str, session: requests.Session) -> tuple:
-    """Handle Google Drive large file confirm token."""
-    url = _gdrive_url(file_id)
-    resp = session.get(url, stream=True)
-    # Check for virus-scan warning page (large files)
-    for key, val in resp.cookies.items():
-        if key.startswith("download_warning"):
-            return f"{url}&confirm={val}", resp
-    return url, resp
-
 def download_data_files():
-    """Download any missing data files from Google Drive."""
+    """
+    Download any missing data files from Google Drive.
+    Handles the virus-scan confirmation page that Google shows for large files.
+    """
     app_dir = os.path.dirname(os.path.abspath(__file__))
     session = requests.Session()
+
     for filename, file_id in DATA_FILES.items():
         dest = os.path.join(app_dir, filename)
-        if os.path.exists(dest):
+        if os.path.exists(dest) and os.path.getsize(dest) > 1024:
+            print(f"  ✓ {filename} already present")
             continue
+
         print(f"Downloading {filename}...")
         try:
-            url, resp = _gdrive_url_large(file_id, session)
-            if resp.status_code != 200:
-                resp = session.get(url, stream=True)
+            # Step 1: initial request
+            url = f"https://drive.google.com/uc?export=download&id={file_id}"
+            resp = session.get(url, stream=True, timeout=60)
+
+            # Step 2: if Google shows a confirm page, extract the token and retry
+            # New-style: confirm token in response body as form field
+            if "text/html" in resp.headers.get("Content-Type", ""):
+                # Try to find confirm token in HTML
+                import re
+                token_match = re.search(r'name="confirm"\s+value="([^"]+)"', resp.text)
+                uuid_match  = re.search(r'name="uuid"\s+value="([^"]+)"', resp.text)
+                if token_match:
+                    confirm = token_match.group(1)
+                    uuid    = uuid_match.group(1) if uuid_match else ""
+                    url = (f"https://drive.usercontent.google.com/download"
+                           f"?id={file_id}&export=download"
+                           f"&confirm={confirm}&uuid={uuid}")
+                    resp = session.get(url, stream=True, timeout=120)
+                else:
+                    # Fallback: try usercontent direct URL
+                    url = (f"https://drive.usercontent.google.com/download"
+                           f"?id={file_id}&export=download&confirm=t")
+                    resp = session.get(url, stream=True, timeout=120)
+
+            # Step 3: write file
             with open(dest, "wb") as f:
-                for chunk in resp.iter_content(chunk_size=32768):
+                for chunk in resp.iter_content(chunk_size=65536):
                     if chunk:
                         f.write(chunk)
-            print(f"  ✓ {filename} saved ({os.path.getsize(dest)//1024} KB)")
+
+            size_kb = os.path.getsize(dest) // 1024
+            print(f"  ✓ {filename} saved ({size_kb} KB)")
+
+            if size_kb < 10:
+                print(f"  ⚠ WARNING: {filename} is very small — may be an error page")
+                os.remove(dest)   # Remove so it retries next startup
+
         except Exception as e:
             print(f"  ✗ Failed to download {filename}: {e}")
 
